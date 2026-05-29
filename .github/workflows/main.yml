@@ -1,0 +1,163 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Otimizar Memória
+        run: |
+          $services = @(
+            "WSearch", "SysMain", "DiagTrack", "MapsBroker",
+            "fax", "TabletInputService", "Spooler", "PrintNotify",
+            "wscsvc", "WerSvc", "wercplsupport", "PcaSvc",
+            "DPS", "WdiServiceHost", "WdiSystemHost",
+            "lfsvc", "XblAuthManager", "XblGameSave",
+            "XboxGipSvc", "XboxNetApiSvc", "wisvc",
+            "RetailDemo", "RemoteRegistry", "SharedAccess",
+            "WMPNetworkSvc", "icssvc", "PhoneSvc",
+            "ScDeviceEnum", "SEMgrSvc", "SmsRouter"
+          )
+          foreach ($svc in $services) {
+            Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+            Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+
+          # Desativar efeitos visuais
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" `
+            -Name "VisualFXSetting" -Value 2 -Force -ErrorAction SilentlyContinue
+
+          # Desativar animações
+          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop\WindowMetrics" `
+            -Name "MinAnimate" -Value 0 -Force -ErrorAction SilentlyContinue
+
+          # Limpar Working Set
+          Get-Process | ForEach-Object {
+            try { $_.MinWorkingSet = 1; $_.MaxWorkingSet = 1 } catch {}
+          }
+
+          [System.GC]::Collect()
+          [System.GC]::WaitForPendingFinalizers()
+          [System.GC]::Collect()
+
+          $ram = Get-CimInstance Win32_OperatingSystem
+          $livre = [math]::Round($ram.FreePhysicalMemory / 1MB, 2)
+          $total = [math]::Round($ram.TotalVisibleMemorySize / 1MB, 2)
+          Write-Host "RAM: $livre GB livre de $total GB"
+
+      - name: Configurar RDP
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
+
+          # Reduzir qualidade RDP para melhor performance em conexões lentas
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "ColorDepth" -Value 2 -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "MaxInstanceCount" -Value 10 -Force -ErrorAction SilentlyContinue
+
+          netsh advfirewall firewall delete rule name="RDP" 2>$null
+          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Criar Usuário
+        run: |
+          $upper   = [char[]](65..90)
+          $lower   = [char[]](97..122)
+          $numbers = [char[]](48..57)
+          $special = [char[]]@(33,35,36,37,64)
+          $all     = $upper + $lower + $numbers + $special
+
+          $password = -join @(
+            ($upper   | Get-Random -Count 2)
+            ($lower   | Get-Random -Count 2)
+            ($numbers | Get-Random -Count 2)
+            ($special | Get-Random -Count 2)
+            ($all     | Get-Random -Count 8)
+          | Sort-Object { Get-Random })
+
+          $pass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (Get-LocalUser -Name "Skyro" -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name "Skyro" -Password $pass
+          } else {
+            New-LocalUser -Name "Skyro" -Password $pass -AccountNeverExpires -FullName "Skyro" -Description "RDP User"
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member "Skyro" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Skyro" -ErrorAction SilentlyContinue
+          echo "SENHA=$password" >> $env:GITHUB_ENV
+
+      - name: Instalar Tailscale
+        run: |
+          $tsPath = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $tsPath)) {
+            Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile "$env:TEMP\ts.msi"
+            Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\ts.msi`" /quiet /norestart" -Wait
+            Remove-Item "$env:TEMP\ts.msi" -Force
+          }
+
+      - name: Conectar Tailscale
+        run: |
+          $tsPath = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $tsPath up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=rdp-skyro --reset
+
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 20) {
+            Start-Sleep -Seconds 5
+            $tsIP = & $tsPath ip -4 2>$null
+            $retries++
+          }
+
+          if (-not $tsIP) {
+            Write-Error "Tailscale sem IP."
+            exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verificar RDP
+        run: |
+          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $test.TcpTestSucceeded) {
+            Write-Error "Porta 3389 não acessível!"
+            exit 1
+          }
+          Write-Host "RDP OK."
+
+      - name: Credenciais de Acesso
+        run: |
+          $ram = Get-CimInstance Win32_OperatingSystem
+          $livre = [math]::Round($ram.FreePhysicalMemory / 1MB, 2)
+          $total = [math]::Round($ram.TotalVisibleMemorySize / 1MB, 2)
+
+          Write-Host ""
+          Write-Host "========== RDP ACCESS =========="
+          Write-Host "  IP       : $env:TAILSCALE_IP"
+          Write-Host "  Usuario  : Skyro"
+          Write-Host "  Senha    : $env:SENHA"
+          Write-Host "  RAM Live : $livre GB / $total GB"
+          Write-Host "================================"
+          Write-Host ""
+
+      - name: Manter Ativo
+        run: |
+          $i = 0
+          while ($true) {
+            $i++
+            $elapsed = $i * 5
+            $ram = Get-CimInstance Win32_OperatingSystem
+            $livre = [math]::Round($ram.FreePhysicalMemory / 1MB, 2)
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Ativo há $elapsed min | RAM livre: $livre GB | IP: $env:TAILSCALE_IP"
+            Start-Sleep -Seconds 300
+          }
